@@ -1,0 +1,37 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# PyTorch checkpoints
+*.pth
+
+# Jupyter Notebooks
+.ipynb_checkpoints/
+
+# Dataset files (typically large)
+dataset/
+data/
+*.tif
+*.tiff
+*.jpg
+*.png
+
+# Model outputs
+training_history.png
+predictions_visualization.png
+
+# IDE specific files
+.idea/
+.vscode/
+.DS_Store 
