@@ -340,6 +340,39 @@ def visualize_predictions(model, dataset, device='cuda', num_samples=4, output_f
     except Exception as e:
         print(f"Error visualizing predictions: {e}")
 
+def match_images_and_masks_custom(image_paths, mask_paths):
+    """
+    Custom function to match images and masks based on the naming convention:
+    - Images: {name}_ch00_t00.tif
+    - Masks: MASK_{name}_t00.tif
+    """
+    matched_images = []
+    matched_masks = []
+    
+    # Extract core names from image paths
+    image_core_names = {}
+    for img_path in image_paths:
+        basename = os.path.splitext(os.path.basename(img_path))[0]
+        # Remove '_ch00_t00' suffix to get core name
+        if basename.endswith('_ch00_t00'):
+            core_name = basename[:-9]  # Remove last 9 characters '_ch00_t00'
+            image_core_names[core_name] = img_path
+        else:
+            # Fallback: use full basename
+            image_core_names[basename] = img_path
+    
+    # Extract core names from mask paths and match
+    for mask_path in mask_paths:
+        basename = os.path.splitext(os.path.basename(mask_path))[0]
+        # Remove 'MASK_' prefix and '_t00' suffix to get core name
+        if basename.startswith('MASK_') and basename.endswith('_t00'):
+            core_name = basename[5:-4]  # Remove 'MASK_' (5 chars) and '_t00' (4 chars)
+            if core_name in image_core_names:
+                matched_images.append(image_core_names[core_name])
+                matched_masks.append(mask_path)
+    
+    return matched_images, matched_masks
+
 def find_best_image_format(image_dir):
     """Find the most common image format in the directory"""
     extensions = ["*.tif", "*.tiff", "*.jpg", "*.jpeg", "*.png"]
@@ -434,30 +467,20 @@ def main():
         print("Please add your data files before running training")
         return
     
-    # Verify that there are matching numbers of images and masks
-    if len(image_paths) != len(mask_paths):
-        print(f"Warning: Unequal number of images ({len(image_paths)}) and masks ({len(mask_paths)})")
-        # Trying to match by filename
-        matched_images = []
-        matched_masks = []
-        
-        image_basenames = [os.path.splitext(os.path.basename(p))[0] for p in image_paths]
-        mask_basenames = [os.path.splitext(os.path.basename(p))[0] for p in mask_paths]
-        
-        for i, img_name in enumerate(image_basenames):
-            if img_name in mask_basenames:
-                mask_idx = mask_basenames.index(img_name)
-                matched_images.append(image_paths[i])
-                matched_masks.append(mask_paths[mask_idx])
-        
-        print(f"Matched {len(matched_images)} image-mask pairs by filename")
-        
-        if len(matched_images) == 0:
-            print("Could not match any images with masks. Please check your data.")
-            return
-            
-        image_paths = matched_images
-        mask_paths = matched_masks
+    # Always use custom matching to properly pair images and masks based on naming convention
+    print("Matching images and masks based on naming convention...")
+    matched_images, matched_masks = match_images_and_masks_custom(image_paths, mask_paths)
+    
+    print(f"Matched {len(matched_images)} image-mask pairs")
+    
+    if len(matched_images) == 0:
+        print("Could not match any images with masks. Please check your data naming convention:")
+        print("Expected: Images ending with '_ch00_t00.tif' and masks starting with 'MASK_' and ending with '_t00.tif'")
+        return
+    
+    # Use the matched pairs
+    image_paths = matched_images
+    mask_paths = matched_masks
     
     # Check if images are grayscale or RGB
     try:

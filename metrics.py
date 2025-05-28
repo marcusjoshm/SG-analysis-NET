@@ -111,25 +111,25 @@ class MetricsTracker:
         dice = 2 * (flat_preds * flat_targets).sum() / (flat_preds.sum() + flat_targets.sum() + 1e-6)
         
         # Update metrics dictionary
-        self.metrics['epoch'].append(epoch)
-        self.metrics['train_loss'].append(train_loss)
-        self.metrics['val_loss'].append(val_loss)
-        self.metrics['dice_score'].append(dice)
-        self.metrics['precision'].append(precision)
-        self.metrics['recall'].append(recall)
-        self.metrics['f1_score'].append(f1)
-        self.metrics['iou'].append(iou)
-        self.metrics['accuracy'].append(accuracy)
-        self.metrics['learning_rate'].append(learning_rate)
-        self.metrics['time_per_epoch'].append(epoch_time)
+        self.metrics['epoch'].append(int(epoch))
+        self.metrics['train_loss'].append(float(train_loss))
+        self.metrics['val_loss'].append(float(val_loss))
+        self.metrics['dice_score'].append(float(dice))
+        self.metrics['precision'].append(float(precision))
+        self.metrics['recall'].append(float(recall))
+        self.metrics['f1_score'].append(float(f1))
+        self.metrics['iou'].append(float(iou))
+        self.metrics['accuracy'].append(float(accuracy))
+        self.metrics['learning_rate'].append(float(learning_rate))
+        self.metrics['time_per_epoch'].append(float(epoch_time))
         
         # Update best metrics if needed
         if dice > self.best_metrics['best_dice']:
-            self.best_metrics['best_dice'] = dice
-            self.best_metrics['best_epoch'] = epoch
+            self.best_metrics['best_dice'] = float(dice)
+            self.best_metrics['best_epoch'] = int(epoch)
             
         if val_loss < self.best_metrics['best_loss']:
-            self.best_metrics['best_loss'] = val_loss
+            self.best_metrics['best_loss'] = float(val_loss)
             
         # Store a few sample predictions for visualization
         # We'll keep 3 samples (first, middle, last)
