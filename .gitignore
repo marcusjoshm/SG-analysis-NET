@@ -20,11 +20,22 @@ ENV/
 .ipynb_checkpoints/
 
 # Dataset files (typically large)
-dataset/
-data/
+# Don't ignore the directories themselves
+!data/
+!data/images/
+!data/masks/
+# But ignore the contents
+data/images/*
+data/masks/*
+# Keep .gitkeep files
+!data/images/.gitkeep
+!data/masks/.gitkeep
+
+# Image files in general
 *.tif
 *.tiff
 *.jpg
+*.jpeg
 *.png
 
 # Model outputs
