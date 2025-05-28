@@ -16,8 +16,8 @@ from torch.utils.data import Dataset, DataLoader
 import torchvision.transforms as transforms
 from torchvision.transforms import functional as F
 
-# Import model architecture from main.py
-from main import UNet, StressGranuleDataset
+# Import model architecture from models.py
+from models import UNet
 
 class InferenceDataset(Dataset):
     """Dataset for inference only (no masks required)"""
