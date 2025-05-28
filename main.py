@@ -4,6 +4,7 @@ import matplotlib.pyplot as plt
 from sklearn.model_selection import train_test_split
 import cv2
 from glob import glob
+from tqdm import tqdm
 
 import torch
 import torch.nn as nn
@@ -14,34 +15,53 @@ from torchvision.transforms import functional as F
 
 # Custom Dataset Class
 class StressGranuleDataset(Dataset):
-    def __init__(self, image_paths, mask_paths, transform=None, target_size=(256, 256)):
+    def __init__(self, image_paths, mask_paths, transform=None, target_size=(256, 256), channels=3):
         self.image_paths = image_paths
         self.mask_paths = mask_paths
         self.transform = transform
         self.target_size = target_size
+        self.channels = channels  # Allow specifying number of channels
         
     def __len__(self):
         return len(self.image_paths)
     
     def __getitem__(self, idx):
         # Load image and mask
-        image = cv2.imread(self.image_paths[idx], cv2.IMREAD_GRAYSCALE)
-        mask = cv2.imread(self.mask_paths[idx], cv2.IMREAD_GRAYSCALE)
+        try:
+            image = cv2.imread(self.image_paths[idx], cv2.IMREAD_GRAYSCALE)
+            if image is None:
+                raise ValueError(f"Failed to load image: {self.image_paths[idx]}")
+                
+            mask = cv2.imread(self.mask_paths[idx], cv2.IMREAD_GRAYSCALE)
+            if mask is None:
+                raise ValueError(f"Failed to load mask: {self.mask_paths[idx]}")
+                
+        except Exception as e:
+            print(f"Error loading images: {e}")
+            # Return a default small image in case of error
+            image = np.zeros((64, 64), dtype=np.uint8)
+            mask = np.zeros((64, 64), dtype=np.uint8)
         
-        # Convert to RGB if needed (adjust based on your data)
-        if len(image.shape) == 2:
+        # Convert to RGB if required
+        if self.channels == 3 and len(image.shape) == 2:
             image = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
         
         # Resize to target size
-        image = cv2.resize(image, self.target_size)
-        mask = cv2.resize(mask, self.target_size)
+        image = cv2.resize(image, self.target_size, interpolation=cv2.INTER_LINEAR)
+        mask = cv2.resize(mask, self.target_size, interpolation=cv2.INTER_NEAREST)  # Use NEAREST for masks
         
         # Normalize image to [0, 1]
         image = image.astype(np.float32) / 255.0
+        
+        # Convert mask to binary (adjust threshold if needed)
         mask = (mask > 127).astype(np.float32)  # Binary threshold
         
         # Convert to tensors
-        image = torch.from_numpy(image.transpose(2, 0, 1))  # HWC to CHW
+        if self.channels == 3:
+            image = torch.from_numpy(image.transpose(2, 0, 1))  # HWC to CHW
+        else:
+            image = torch.from_numpy(image).unsqueeze(0)  # Add channel dimension for grayscale
+            
         mask = torch.from_numpy(mask).unsqueeze(0)  # Add channel dimension
         
         if self.transform:
@@ -109,8 +129,9 @@ class UNet(nn.Module):
             x = self.ups[idx](x)
             skip_connection = skip_connections[idx//2]
 
-            if x.shape != skip_connection.shape:
-                x = F.resize(x, size=skip_connection.shape[2:])
+            # Handle potential shape mismatch properly
+            if x.shape[2:] != skip_connection.shape[2:]:
+                x = F.resize(x, size=skip_connection.shape[2:], interpolation=transforms.InterpolationMode.NEAREST)
 
             concat_skip = torch.cat((skip_connection, x), dim=1)
             x = self.ups[idx+1](concat_skip)
@@ -137,7 +158,8 @@ def combined_loss(pred, target, alpha=0.5):
     dice = dice_loss(pred, target)
     return alpha * bce + (1 - alpha) * dice
 
-def train_model(model, train_loader, val_loader, num_epochs=100, learning_rate=1e-4, device='cuda'):
+def train_model(model, train_loader, val_loader, num_epochs=100, learning_rate=1e-4, 
+                patience=15, device='cuda'):
     model = model.to(device)
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=10, factor=0.5)
@@ -147,13 +169,17 @@ def train_model(model, train_loader, val_loader, num_epochs=100, learning_rate=1
     val_dice_scores = []
     
     best_dice = 0.0
+    counter = 0  # For early stopping
     
     for epoch in range(num_epochs):
         # Training phase
         model.train()
         train_loss = 0.0
         
-        for batch_idx, (data, target) in enumerate(train_loader):
+        # Use tqdm for progress bar
+        loop = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}")
+        
+        for batch_idx, (data, target) in enumerate(loop):
             data, target = data.to(device), target.to(device)
             
             optimizer.zero_grad()
@@ -163,6 +189,9 @@ def train_model(model, train_loader, val_loader, num_epochs=100, learning_rate=1
             optimizer.step()
             
             train_loss += loss.item()
+            
+            # Update progress bar
+            loop.set_postfix(loss=loss.item())
         
         # Validation phase
         model.eval()
@@ -191,13 +220,21 @@ def train_model(model, train_loader, val_loader, num_epochs=100, learning_rate=1
         if val_dice > best_dice:
             best_dice = val_dice
             torch.save(model.state_dict(), 'best_stress_granule_model.pth')
+            counter = 0  # Reset counter when improvement found
+        else:
+            counter += 1
         
-        if epoch % 10 == 0:
-            print(f'Epoch {epoch}/{num_epochs}:')
-            print(f'  Train Loss: {train_loss:.4f}')
-            print(f'  Val Loss: {val_loss:.4f}')
-            print(f'  Val Dice: {val_dice:.4f}')
-            print(f'  Learning Rate: {optimizer.param_groups[0]["lr"]:.6f}')
+        # Print progress
+        print(f'Epoch {epoch+1}/{num_epochs}:')
+        print(f'  Train Loss: {train_loss:.4f}')
+        print(f'  Val Loss: {val_loss:.4f}')
+        print(f'  Val Dice: {val_dice:.4f}')
+        print(f'  Learning Rate: {optimizer.param_groups[0]["lr"]:.6f}')
+        
+        # Early stopping
+        if counter >= patience:
+            print(f"Early stopping triggered after {epoch+1} epochs")
+            break
     
     return train_losses, val_losses, val_dice_scores
 
@@ -240,12 +277,19 @@ def visualize_predictions(model, dataset, device='cuda', num_samples=4):
             pred = model(image_batch).cpu().squeeze()
             
             # Convert to numpy for visualization
-            image_np = image.permute(1, 2, 0).numpy()
+            if image.shape[0] == 3:  # RGB
+                image_np = image.permute(1, 2, 0).numpy()
+            else:  # Grayscale
+                image_np = image.squeeze().numpy()
+                
             mask_np = mask.squeeze().numpy()
             pred_np = (pred > 0.5).float().numpy()
             
             # Plot
-            axes[i, 0].imshow(image_np)
+            if image.shape[0] == 1:  # Handle grayscale images
+                axes[i, 0].imshow(image_np, cmap='gray')
+            else:
+                axes[i, 0].imshow(image_np)
             axes[i, 0].set_title('Original Image')
             axes[i, 0].axis('off')
             
@@ -271,14 +315,36 @@ def main():
     image_dir = "data/images"
     mask_dir = "data/masks"
     
+    # Check if directories exist, create if not
+    os.makedirs(image_dir, exist_ok=True)
+    os.makedirs(mask_dir, exist_ok=True)
+    
+    # Support multiple file extensions
+    extensions = ["*.tif", "*.tiff", "*.jpg", "*.jpeg", "*.png"]
+    
     # Get file paths
-    image_paths = sorted(glob(os.path.join(image_dir, "*.tif")))  # Adjust extension if needed
-    mask_paths = sorted(glob(os.path.join(mask_dir, "*.tif")))    # Adjust extension if needed
+    image_paths = []
+    for ext in extensions:
+        image_paths.extend(sorted(glob(os.path.join(image_dir, ext))))
+    
+    mask_paths = []
+    for ext in extensions:
+        mask_paths.extend(sorted(glob(os.path.join(mask_dir, ext))))
     
     print(f"Found {len(image_paths)} images and {len(mask_paths)} masks")
     
+    if len(image_paths) == 0 or len(mask_paths) == 0:
+        print(f"No images or masks found in {image_dir} and {mask_dir}")
+        print("Please add your data files before running training")
+        return
+    
     # Verify data alignment
     assert len(image_paths) == len(mask_paths), "Number of images and masks must match"
+    
+    # Check if images are grayscale or RGB
+    sample_img = cv2.imread(image_paths[0])
+    input_channels = 3 if sample_img.ndim == 3 else 1
+    print(f"Detected {input_channels} input channels")
     
     # Split data
     train_images, val_images, train_masks, val_masks = train_test_split(
@@ -293,16 +359,19 @@ def main():
     ])
     
     # Create datasets
-    train_dataset = StressGranuleDataset(train_images, train_masks, transform=train_transform)
-    val_dataset = StressGranuleDataset(val_images, val_masks)
+    train_dataset = StressGranuleDataset(train_images, train_masks, transform=train_transform, channels=input_channels)
+    val_dataset = StressGranuleDataset(val_images, val_masks, channels=input_channels)
     
     # Create data loaders
     batch_size = 8
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
+    # Adjust num_workers based on available CPU cores
+    num_workers = min(4, os.cpu_count() or 1)
+    
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
     
     # Initialize model
-    model = UNet(in_channels=3, out_channels=1)
+    model = UNet(in_channels=input_channels, out_channels=1)
     
     print(f"Model has {sum(p.numel() for p in model.parameters() if p.requires_grad)} trainable parameters")
     
@@ -310,7 +379,7 @@ def main():
     print("Starting training...")
     train_losses, val_losses, val_dice_scores = train_model(
         model, train_loader, val_loader, 
-        num_epochs=100, learning_rate=1e-4, device=device
+        num_epochs=100, learning_rate=1e-4, patience=15, device=device
     )
     
     # Plot training history
