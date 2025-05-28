@@ -9,6 +9,8 @@ from glob import glob
 from tqdm import tqdm
 import sys
 import time
+import argparse
+from datetime import datetime
 
 import torch
 import torch.nn as nn
@@ -16,6 +18,9 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 import torchvision.transforms as transforms
 from torchvision.transforms import functional as F
+
+# Import metrics system
+from metrics import MetricsTracker, evaluate_thresholds, plot_threshold_analysis
 
 # Custom Dataset Class
 class StressGranuleDataset(Dataset):
@@ -260,7 +265,8 @@ def load_checkpoint(model, optimizer, filename, device):
         return model, optimizer, 0, 0.0
 
 def train_model(model, train_loader, val_loader, num_epochs=100, learning_rate=1e-4, 
-                patience=15, device='cuda', resume_from=None):
+                patience=15, device='cuda', resume_from=None, metrics_tracker=None,
+                experiment_name=None):
     model = model.to(device)
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
     
@@ -273,6 +279,10 @@ def train_model(model, train_loader, val_loader, num_epochs=100, learning_rate=1
     counter = 0  # For early stopping
     start_epoch = 0
     
+    # Create metrics tracker if not provided
+    if metrics_tracker is None:
+        metrics_tracker = MetricsTracker(experiment_name=experiment_name)
+    
     # Try to load checkpoint if resume_from is provided
     if resume_from and os.path.exists(resume_from):
         model, optimizer, start_epoch, best_dice = load_checkpoint(model, optimizer, resume_from, device)
@@ -281,6 +291,9 @@ def train_model(model, train_loader, val_loader, num_epochs=100, learning_rate=1
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=10, factor=0.5)
     
     for epoch in range(start_epoch, num_epochs):
+        # Start timing for this epoch
+        metrics_tracker.start_epoch()
+        
         # Training phase
         model.train()
         train_loss = 0.0
@@ -332,6 +345,10 @@ def train_model(model, train_loader, val_loader, num_epochs=100, learning_rate=1
         val_dice = 0.0
         val_samples = 0
         
+        # For tracking all predictions and targets for metrics calculation
+        all_val_preds = []
+        all_val_targets = []
+        
         with torch.no_grad():
             for data, target in val_loader:
                 try:
@@ -350,6 +367,11 @@ def train_model(model, train_loader, val_loader, num_epochs=100, learning_rate=1
                     val_loss += combined_loss(output, target).item()
                     val_dice += dice_coefficient(output, target).item()
                     val_samples += 1
+                    
+                    # Collect predictions and targets for metrics
+                    all_val_preds.append(output.detach().cpu())
+                    all_val_targets.append(target.detach().cpu())
+                    
                 except Exception as e:
                     print(f"Error in validation: {e}")
         
@@ -367,7 +389,19 @@ def train_model(model, train_loader, val_loader, num_epochs=100, learning_rate=1
         val_losses.append(val_loss)
         val_dice_scores.append(val_dice)
         
+        # Update learning rate scheduler
         scheduler.step(val_loss)
+        
+        # Concatenate all validation predictions and targets
+        all_preds_tensor = torch.cat(all_val_preds, dim=0) if all_val_preds else torch.tensor([])
+        all_targets_tensor = torch.cat(all_val_targets, dim=0) if all_val_targets else torch.tensor([])
+        
+        # Update metrics tracker
+        current_lr = optimizer.param_groups[0]["lr"]
+        metrics_tracker.end_epoch(epoch, train_loss, val_loss, all_preds_tensor, all_targets_tensor, current_lr)
+        
+        # Get current metrics summary
+        metrics_summary = metrics_tracker.get_current_metrics_summary()
         
         # Save best model
         if val_dice > best_dice:
@@ -386,14 +420,31 @@ def train_model(model, train_loader, val_loader, num_epochs=100, learning_rate=1
         print(f'  Train Loss: {train_loss:.4f}')
         print(f'  Val Loss: {val_loss:.4f}')
         print(f'  Val Dice: {val_dice:.4f}')
-        print(f'  Learning Rate: {optimizer.param_groups[0]["lr"]:.6f}')
+        print(f'  Precision: {metrics_summary["precision"]:.4f}')
+        print(f'  Recall: {metrics_summary["recall"]:.4f}')
+        print(f'  Learning Rate: {current_lr:.6f}')
+        
+        # Plot metrics every 10 epochs
+        if epoch % 10 == 0 or epoch == num_epochs - 1:
+            metrics_tracker.plot_metrics()
         
         # Early stopping
         if counter >= patience:
             print(f"Early stopping triggered after {epoch+1} epochs")
             break
     
-    return train_losses, val_losses, val_dice_scores
+    # Final metrics plots
+    metrics_tracker.plot_metrics()
+    
+    # Find optimal threshold on validation set
+    if len(all_val_preds) > 0:
+        try:
+            threshold_results = evaluate_thresholds(model, val_loader, device)
+            plot_threshold_analysis(threshold_results, save_path=os.path.join(metrics_tracker.save_dir, 'threshold_analysis.png'))
+        except Exception as e:
+            print(f"Error during threshold analysis: {e}")
+    
+    return train_losses, val_losses, val_dice_scores, metrics_tracker
 
 def plot_training_history(train_losses, val_losses, val_dice_scores):
     """Plot training metrics"""
@@ -513,6 +564,43 @@ def find_best_image_format(image_dir):
 
 # Main execution function
 def main():
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description='Train a U-Net model for stress granule segmentation')
+    parser.add_argument('--data_dir', type=str, default='data',
+                        help='Base directory for data (default: data)')
+    parser.add_argument('--image_dir', type=str, default=None,
+                        help='Directory containing images (default: data/images)')
+    parser.add_argument('--mask_dir', type=str, default=None,
+                        help='Directory containing masks (default: data/masks)')
+    parser.add_argument('--batch_size', type=int, default=8,
+                        help='Batch size for training (default: 8)')
+    parser.add_argument('--epochs', type=int, default=100,
+                        help='Number of epochs to train (default: 100)')
+    parser.add_argument('--learning_rate', type=float, default=1e-4,
+                        help='Learning rate (default: 0.0001)')
+    parser.add_argument('--patience', type=int, default=15,
+                        help='Early stopping patience (default: 15)')
+    parser.add_argument('--image_size', type=int, default=256,
+                        help='Size to resize images (default: 256)')
+    parser.add_argument('--experiment_name', type=str, default=None,
+                        help='Name for this experiment (default: timestamp)')
+    parser.add_argument('--resume', action='store_true',
+                        help='Resume training from checkpoint if available')
+    parser.add_argument('--checkpoint', type=str, default='checkpoint.pth',
+                        help='Checkpoint file to resume from (default: checkpoint.pth)')
+    
+    args = parser.parse_args()
+    
+    # Set experiment name if not provided
+    if args.experiment_name is None:
+        args.experiment_name = f"experiment_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    
+    # Set image and mask directories
+    if args.image_dir is None:
+        args.image_dir = os.path.join(args.data_dir, 'images')
+    if args.mask_dir is None:
+        args.mask_dir = os.path.join(args.data_dir, 'masks')
+    
     # Set device
     if torch.cuda.is_available():
         device = torch.device('cuda')
@@ -524,8 +612,8 @@ def main():
         print("Using CPU")
     
     # Data paths
-    image_dir = "data/images"
-    mask_dir = "data/masks"
+    image_dir = args.image_dir
+    mask_dir = args.mask_dir
     
     # Check if directories exist, create if not
     os.makedirs(image_dir, exist_ok=True)
@@ -602,6 +690,13 @@ def main():
     print(f"Training set: {len(train_images)} images")
     print(f"Validation set: {len(val_images)} images")
     
+    # Create metrics directory
+    metrics_dir = os.path.join('metrics', args.experiment_name)
+    os.makedirs(metrics_dir, exist_ok=True)
+    
+    # Initialize metrics tracker
+    metrics_tracker = MetricsTracker(save_dir=metrics_dir, experiment_name=args.experiment_name)
+    
     # Data augmentation transforms
     train_transform = transforms.Compose([
         transforms.RandomHorizontalFlip(p=0.5),
@@ -610,21 +705,31 @@ def main():
     ])
     
     # Create datasets
-    train_dataset = StressGranuleDataset(train_images, train_masks, transform=train_transform, channels=input_channels)
-    val_dataset = StressGranuleDataset(val_images, val_masks, channels=input_channels)
+    train_dataset = StressGranuleDataset(
+        train_images, train_masks, 
+        transform=train_transform, 
+        channels=input_channels,
+        target_size=(args.image_size, args.image_size)
+    )
+    
+    val_dataset = StressGranuleDataset(
+        val_images, val_masks, 
+        channels=input_channels,
+        target_size=(args.image_size, args.image_size)
+    )
     
     # Determine batch size based on GPU memory
     if torch.cuda.is_available():
         # Auto-tune batch size based on GPU memory
         gpu_mem = torch.cuda.get_device_properties(0).total_memory / 1e9  # GB
         if gpu_mem > 10:  # High-end GPU
-            batch_size = 16
+            batch_size = min(16, args.batch_size)
         elif gpu_mem > 6:  # Mid-range GPU
-            batch_size = 8
+            batch_size = min(8, args.batch_size)
         else:  # Low-end GPU
-            batch_size = 4
+            batch_size = min(4, args.batch_size)
     else:
-        batch_size = 4  # Default for CPU
+        batch_size = args.batch_size
     
     print(f"Using batch size: {batch_size}")
     
@@ -655,26 +760,27 @@ def main():
     
     print(f"Model has {sum(p.numel() for p in model.parameters() if p.requires_grad)} trainable parameters")
     
-    # Check for existing checkpoint
-    checkpoint_path = 'checkpoint.pth'
-    resume_training = os.path.exists(checkpoint_path)
+    # Check for existing checkpoint if resuming
+    checkpoint_path = args.checkpoint if args.resume else None
     
     # Train model
     print("Starting training...")
     start_time = time.time()
     
     try:
-        train_losses, val_losses, val_dice_scores = train_model(
+        train_losses, val_losses, val_dice_scores, metrics_tracker = train_model(
             model, train_loader, val_loader, 
-            num_epochs=100, learning_rate=1e-4, patience=15, device=device,
-            resume_from=checkpoint_path if resume_training else None
+            num_epochs=args.epochs, 
+            learning_rate=args.learning_rate, 
+            patience=args.patience, 
+            device=device,
+            resume_from=checkpoint_path,
+            metrics_tracker=metrics_tracker,
+            experiment_name=args.experiment_name
         )
         
         training_time = time.time() - start_time
         print(f"Training completed in {training_time/60:.2f} minutes")
-        
-        # Plot training history
-        plot_training_history(train_losses, val_losses, val_dice_scores)
         
         # Load best model and visualize predictions
         if os.path.exists('best_stress_granule_model.pth'):
@@ -683,12 +789,35 @@ def main():
             model.load_state_dict(checkpoint['model_state_dict'])
             print(f"Loaded best model with dice score: {checkpoint['best_dice']:.4f}")
             
-            visualize_predictions(model, val_dataset, device)
+            # Visualize predictions
+            visualize_predictions(
+                model, val_dataset, device, 
+                output_file=os.path.join(metrics_dir, 'predictions_visualization.png')
+            )
+            
+            # Get confusion matrix
+            val_preds = []
+            val_targets = []
+            
+            model.eval()
+            with torch.no_grad():
+                for data, target in tqdm(val_loader, desc="Computing confusion matrix"):
+                    data, target = data.to(device), target.to(device)
+                    output = model(data)
+                    val_preds.append(output.cpu())
+                    val_targets.append(target.cpu())
+            
+            all_preds = torch.cat(val_preds, dim=0)
+            all_targets = torch.cat(val_targets, dim=0)
+            
+            # Plot confusion matrix
+            metrics_tracker.plot_confusion_matrix(all_preds, all_targets)
         else:
             print("Warning: Best model file not found. Using last model state.")
             visualize_predictions(model, val_dataset, device)
         
         print("Training completed! Best model saved as 'best_stress_granule_model.pth'")
+        print(f"Metrics and visualizations saved in {metrics_dir}")
         
     except KeyboardInterrupt:
         print("Training interrupted by user. Saving current model state...")
