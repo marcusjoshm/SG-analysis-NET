@@ -42,6 +42,12 @@ data/masks/*
 training_history.png
 predictions_visualization.png
 
+# Training and inference outputs
+metrics/
+*predictions*/
+enhanced_visualizations*/
+test_data/
+
 # IDE specific files
 .idea/
 .vscode/

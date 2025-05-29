@@ -19,6 +19,38 @@ from torchvision.transforms import functional as F
 # Import model architecture from models.py
 from models import UNet
 
+def enhance_contrast_for_visualization(image):
+    """Enhanced contrast adjustment for better visualization (same as training)"""
+    if image.dtype == np.uint16:
+        # Convert to float for processing
+        img_float = image.astype(np.float32)
+        
+        # Get current range
+        img_min = img_float.min()
+        img_max = img_float.max()
+        
+        if img_max > img_min:
+            # Stretch to better utilize dynamic range
+            stretched = (img_float - img_min) / (img_max - img_min)
+            
+            # Fixed enhancement for visualization (no random factors)
+            contrast_factor = 1.5  # Strong contrast boost for visibility
+            stretched = stretched * contrast_factor
+            stretched = np.clip(stretched, 0, 1)
+            
+            # Convert to 8-bit range
+            enhanced = (stretched * 255).astype(np.uint8)
+        else:
+            enhanced = np.zeros_like(image, dtype=np.uint8)
+            
+        return enhanced
+    else:
+        # Already 8-bit, apply moderate enhancement
+        contrast = 1.3
+        brightness = 20
+        adjusted = cv2.convertScaleAbs(image, alpha=contrast, beta=brightness)
+        return adjusted
+
 class InferenceDataset(Dataset):
     """Dataset for inference only (no masks required)"""
     def __init__(self, image_paths, target_size=(256, 256), channels=3):
@@ -32,12 +64,17 @@ class InferenceDataset(Dataset):
     def __getitem__(self, idx):
         # Load image
         try:
-            image = cv2.imread(self.image_paths[idx])
+            # Load image with 16-bit support (same as training)
+            image = cv2.imread(self.image_paths[idx], cv2.IMREAD_UNCHANGED)
             if image is None:
                 raise ValueError(f"Failed to load image: {self.image_paths[idx]}")
-                
-            # Convert BGR to RGB
-            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            
+            # Apply the same contrast enhancement as training
+            image = enhance_contrast_for_visualization(image)
+            
+            # Convert BGR to RGB for color images
+            if len(image.shape) == 3:
+                image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
                 
         except Exception as e:
             print(f"Error loading image: {e}")
@@ -54,7 +91,7 @@ class InferenceDataset(Dataset):
         # Resize to target size
         image = cv2.resize(image, self.target_size, interpolation=cv2.INTER_LINEAR)
         
-        # Normalize image to [0, 1]
+        # Normalize image to [0, 1] (now working with enhanced contrast)
         image = image.astype(np.float32) / 255.0
         
         # Convert to tensor
@@ -135,24 +172,46 @@ def run_inference(model, dataset, batch_size=4, device='cpu', threshold=0.5, sav
                 cv2.imwrite(output_path, binary_pred)
                 
                 # Optional: create overlay visualization
-                original_img = cv2.imread(file_path)
+                original_img = cv2.imread(file_path, cv2.IMREAD_UNCHANGED)  # Load with 16-bit support
                 if original_img is not None:
-                    overlay = original_img.copy()
-                    # Create colored mask (red)
-                    mask_colored = np.zeros_like(original_img)
+                    # Apply contrast enhancement for better visualization
+                    enhanced_img = enhance_contrast_for_visualization(original_img)
+                    
+                    # Convert to BGR if needed for overlay
+                    if len(enhanced_img.shape) == 3:
+                        overlay = enhanced_img.copy()
+                    else:
+                        # Convert grayscale to BGR for colored overlay
+                        overlay = cv2.cvtColor(enhanced_img, cv2.COLOR_GRAY2BGR)
+                    
+                    # Create colored mask (bright red for predictions)
+                    mask_colored = np.zeros_like(overlay)
                     mask_colored[binary_pred > 0] = [0, 0, 255]  # Red in BGR
-                    # Blend
-                    alpha = 0.4
+                    
+                    # Blend with stronger alpha for better visibility
+                    alpha = 0.5
                     overlay = cv2.addWeighted(overlay, 1-alpha, mask_colored, alpha, 0)
-                    # Save overlay
+                    
+                    # Save enhanced overlay
                     overlay_path = os.path.join(save_dir, f"{base_name}_overlay.png")
                     cv2.imwrite(overlay_path, overlay)
+                    
+                    # Also save the enhanced original for comparison
+                    enhanced_path = os.path.join(save_dir, f"{base_name}_enhanced.png")
+                    if len(enhanced_img.shape) == 3:
+                        cv2.imwrite(enhanced_path, enhanced_img)
+                    else:
+                        cv2.imwrite(enhanced_path, cv2.cvtColor(enhanced_img, cv2.COLOR_GRAY2BGR))
+                else:
+                    overlay_path = None
+                    enhanced_path = None
                 
                 # Store result info
                 results.append({
                     'filename': filename,
                     'prediction_path': output_path,
-                    'overlay_path': overlay_path if original_img is not None else None,
+                    'overlay_path': overlay_path,
+                    'enhanced_path': enhanced_path,
                     'pixels_segmented': np.sum(binary_pred > 0),
                     'total_pixels': orig_h * orig_w,
                     'percent_segmented': (np.sum(binary_pred > 0) / (orig_h * orig_w)) * 100
@@ -168,39 +227,66 @@ def run_inference(model, dataset, batch_size=4, device='cpu', threshold=0.5, sav
     return results_df
 
 def create_montage(results_df, save_dir, max_images=16):
-    """Create a montage of original images and their predictions"""
+    """Create a montage of enhanced original images and their predictions"""
     n_images = min(len(results_df), max_images)
     if n_images == 0:
         print("No images to create montage")
         return
     
-    # Calculate grid size
-    grid_size = int(np.ceil(np.sqrt(n_images)))
+    # Calculate grid size for 2x grid (original enhanced + overlay)
+    grid_cols = int(np.ceil(np.sqrt(n_images)))
+    grid_rows = int(np.ceil(n_images / grid_cols))
     
-    # Create figure
-    fig, axes = plt.subplots(grid_size, grid_size, figsize=(grid_size*4, grid_size*4))
-    axes = axes.flatten()
+    # Create figure with 2 columns per image (enhanced + overlay)
+    fig, axes = plt.subplots(grid_rows, grid_cols * 2, figsize=(grid_cols*8, grid_rows*4))
+    if grid_rows == 1:
+        axes = axes.reshape(1, -1)
     
-    for i in range(grid_size * grid_size):
-        if i < n_images:
-            # Load overlay image
+    for i in range(n_images):
+        row = i // grid_cols
+        col = (i % grid_cols) * 2
+        
+        filename = os.path.basename(results_df.iloc[i]['filename'])
+        
+        # Enhanced original image
+        if col < axes.shape[1]:
+            enhanced_path = results_df.iloc[i].get('enhanced_path')
+            if enhanced_path and os.path.exists(enhanced_path):
+                img = cv2.imread(enhanced_path)
+                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                axes[row, col].imshow(img)
+                axes[row, col].set_title(f"Enhanced: {filename}")
+            else:
+                axes[row, col].text(0.5, 0.5, "Enhanced not available", 
+                                   horizontalalignment='center', verticalalignment='center')
+            axes[row, col].axis('off')
+        
+        # Overlay image
+        if col + 1 < axes.shape[1]:
             overlay_path = results_df.iloc[i]['overlay_path']
             if overlay_path and os.path.exists(overlay_path):
                 img = cv2.imread(overlay_path)
                 img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                axes[i].imshow(img)
-                axes[i].set_title(os.path.basename(results_df.iloc[i]['filename']))
+                axes[row, col + 1].imshow(img)
+                axes[row, col + 1].set_title(f"Predictions: {filename}")
             else:
-                axes[i].text(0.5, 0.5, "Image not available", 
-                            horizontalalignment='center', verticalalignment='center')
-        
-        # Turn off axis
-        axes[i].axis('off')
+                axes[row, col + 1].text(0.5, 0.5, "Overlay not available", 
+                                       horizontalalignment='center', verticalalignment='center')
+            axes[row, col + 1].axis('off')
+    
+    # Hide any unused subplots
+    for i in range(n_images, grid_rows * grid_cols):
+        row = i // grid_cols
+        col = (i % grid_cols) * 2
+        if col < axes.shape[1]:
+            axes[row, col].axis('off')
+        if col + 1 < axes.shape[1]:
+            axes[row, col + 1].axis('off')
     
     plt.tight_layout()
-    plt.savefig(os.path.join(save_dir, 'inference_montage.png'))
+    plt.savefig(os.path.join(save_dir, 'enhanced_inference_montage.png'), dpi=150, bbox_inches='tight')
     plt.close()
-    print(f"Montage saved to {os.path.join(save_dir, 'inference_montage.png')}")
+    print(f"Enhanced montage saved to {os.path.join(save_dir, 'enhanced_inference_montage.png')}")
 
 def main():
     parser = argparse.ArgumentParser(description='Run inference with trained stress granule segmentation model')
