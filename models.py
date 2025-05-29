@@ -81,6 +81,120 @@ class StressGranuleDataset(torch.utils.data.Dataset):
         
         return image, mask
 
+# Enhanced Dataset Class for 16-bit images with preprocessing
+class StressGranule16bitDataset(torch.utils.data.Dataset):
+    def __init__(self, image_paths, mask_paths, transform=None, target_size=(256, 256), 
+                 enhance_contrast=True, gaussian_sigma=1.7):
+        self.image_paths = image_paths
+        self.mask_paths = mask_paths
+        self.transform = transform
+        self.target_size = target_size
+        self.enhance_contrast = enhance_contrast
+        self.gaussian_sigma = gaussian_sigma
+        
+        # Validate paths exist
+        self._validate_paths()
+        
+    def _validate_paths(self):
+        """Check if all image and mask paths exist."""
+        for img_path, mask_path in zip(self.image_paths, self.mask_paths):
+            if not os.path.exists(img_path):
+                print(f"Warning: Image path does not exist: {img_path}")
+            if not os.path.exists(mask_path):
+                print(f"Warning: Mask path does not exist: {mask_path}")
+        
+    def __len__(self):
+        return len(self.image_paths)
+    
+    def _enhance_contrast(self, image, percentile_low=1, percentile_high=99):
+        """
+        Enhance contrast of 16-bit image using percentile stretching.
+        This is especially useful for images with low intensity values (200-300 max).
+        """
+        # Calculate percentiles for non-zero pixels to avoid background
+        non_zero_pixels = image[image > 0]
+        if len(non_zero_pixels) > 0:
+            p_low = np.percentile(non_zero_pixels, percentile_low)
+            p_high = np.percentile(non_zero_pixels, percentile_high)
+        else:
+            # Fallback if all pixels are zero
+            p_low = 0
+            p_high = 1
+        
+        # Clip and rescale
+        if p_high > p_low:
+            image_clipped = np.clip(image, p_low, p_high)
+            image_rescaled = (image_clipped - p_low) / (p_high - p_low)
+        else:
+            # Handle edge case where all values are the same
+            image_rescaled = np.zeros_like(image, dtype=np.float32)
+        
+        return image_rescaled
+    
+    def __getitem__(self, idx):
+        try:
+            # Load 16-bit image using cv2.IMREAD_UNCHANGED to preserve bit depth
+            image = cv2.imread(self.image_paths[idx], cv2.IMREAD_UNCHANGED)
+            if image is None:
+                raise ValueError(f"Failed to load image: {self.image_paths[idx]}")
+            
+            # Load 8-bit mask as grayscale
+            mask = cv2.imread(self.mask_paths[idx], cv2.IMREAD_GRAYSCALE)
+            if mask is None:
+                raise ValueError(f"Failed to load mask: {self.mask_paths[idx]}")
+            
+            # Ensure image is single channel
+            if len(image.shape) > 2:
+                # If multi-channel, convert to grayscale
+                image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+            
+            # Convert to float32 for processing
+            image = image.astype(np.float32)
+            
+            # Apply Gaussian blur before contrast enhancement
+            if self.gaussian_sigma > 0:
+                image = cv2.GaussianBlur(image, (0, 0), self.gaussian_sigma)
+            
+            # Normalize based on actual bit depth
+            if image.max() > 255:  # 16-bit image
+                # For 16-bit images with low values (200-300), direct normalization would be too dark
+                if self.enhance_contrast:
+                    image = self._enhance_contrast(image)
+                else:
+                    # Simple normalization for 16-bit
+                    image = image / 65535.0
+            else:
+                # 8-bit image
+                image = image / 255.0
+            
+            # Resize to target size
+            image = cv2.resize(image, self.target_size, interpolation=cv2.INTER_LINEAR)
+            mask = cv2.resize(mask, self.target_size, interpolation=cv2.INTER_NEAREST)
+            
+            # Ensure mask is binary (0 or 1)
+            mask = (mask > 127).astype(np.float32)
+            
+            # Convert to tensors
+            image = torch.from_numpy(image).unsqueeze(0)  # Add channel dimension
+            mask = torch.from_numpy(mask).unsqueeze(0)    # Add channel dimension
+            
+            if self.transform:
+                # Apply same transform to both image and mask
+                seed = torch.randint(0, 2**32, (1,)).item()
+                torch.manual_seed(seed)
+                image = self.transform(image)
+                torch.manual_seed(seed)
+                mask = self.transform(mask)
+            
+            return image, mask
+            
+        except Exception as e:
+            print(f"Error loading images at index {idx}: {e}")
+            # Return a default image in case of error
+            image = torch.zeros((1, self.target_size[0], self.target_size[1]), dtype=torch.float32)
+            mask = torch.zeros((1, self.target_size[0], self.target_size[1]), dtype=torch.float32)
+            return image, mask
+
 # U-Net Architecture
 class DoubleConv(nn.Module):
     def __init__(self, in_channels, out_channels):

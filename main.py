@@ -20,7 +20,7 @@ import torchvision.transforms as transforms
 from torchvision.transforms import functional as F
 
 # Import model classes and functions
-from models import UNet, StressGranuleDataset, dice_coefficient, dice_loss, combined_loss
+from models import UNet, StressGranuleDataset, StressGranule16bitDataset, dice_coefficient, dice_loss, combined_loss
 
 # Import metrics system
 from metrics import MetricsTracker, evaluate_thresholds, plot_threshold_analysis
@@ -461,21 +461,27 @@ def main():
     
     # Check if images are grayscale or RGB
     try:
-        sample_img = cv2.imread(image_paths[0])
+        sample_img = cv2.imread(image_paths[0], cv2.IMREAD_UNCHANGED)  # Read unchanged to preserve bit depth
         if sample_img is None:
             raise ValueError(f"Failed to load sample image: {image_paths[0]}")
             
-        # Check if grayscale or color
-        if len(sample_img.shape) == 2 or sample_img.shape[2] == 1:
-            input_channels = 1
-        else:
-            input_channels = 3
-            
-        print(f"Detected {input_channels} input channels")
+        # Check bit depth and channels
+        is_16bit = sample_img.dtype == np.uint16
+        is_grayscale = len(sample_img.shape) == 2 or sample_img.shape[2] == 1
+        
+        # For your stress granule data, we expect single channel 16-bit images
+        input_channels = 1  # Force single channel for stress granule analysis
+        
+        print(f"Detected image properties:")
+        print(f"  - Bit depth: {'16-bit' if is_16bit else '8-bit'}")
+        print(f"  - Channels: {input_channels} (grayscale)")
+        print(f"  - Max value in sample: {sample_img.max()}")
+        
     except Exception as e:
         print(f"Error detecting input channels: {e}")
-        print("Defaulting to 3 channels (RGB)")
-        input_channels = 3
+        print("Defaulting to 1 channel (grayscale)")
+        input_channels = 1
+        is_16bit = True  # Assume 16-bit for safety
     
     # Split data
     train_images, val_images, train_masks, val_masks = train_test_split(
@@ -499,18 +505,20 @@ def main():
         transforms.RandomRotation(degrees=90),
     ])
     
-    # Create datasets
-    train_dataset = StressGranuleDataset(
+    # Create datasets using the 16-bit dataset class for stress granule data
+    train_dataset = StressGranule16bitDataset(
         train_images, train_masks, 
         transform=train_transform, 
-        channels=input_channels,
-        target_size=(args.image_size, args.image_size)
+        target_size=(args.image_size, args.image_size),
+        enhance_contrast=True,  # Enable contrast enhancement for low intensity values
+        gaussian_sigma=1.7      # Apply Gaussian blur as requested
     )
     
-    val_dataset = StressGranuleDataset(
+    val_dataset = StressGranule16bitDataset(
         val_images, val_masks, 
-        channels=input_channels,
-        target_size=(args.image_size, args.image_size)
+        target_size=(args.image_size, args.image_size),
+        enhance_contrast=True,
+        gaussian_sigma=1.7
     )
     
     # Determine batch size based on GPU memory
