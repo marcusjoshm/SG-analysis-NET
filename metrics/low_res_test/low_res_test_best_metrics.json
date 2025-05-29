@@ -1,5 +1,5 @@
 {
-    "best_dice": 0.0,
-    "best_epoch": 0,
-    "best_loss": 0.7700748443603516
+    "best_dice": 0.880477344714993,
+    "best_epoch": 7,
+    "best_loss": 0.6215546131134033
 }

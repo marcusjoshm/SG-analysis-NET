@@ -16,19 +16,24 @@ from main import train_model, visualize_predictions, plot_training_history
 import matplotlib.pyplot as plt
 
 def main():
-    # Low resolution configuration for memory-limited systems
-    IMAGE_SIZE = 512  # Reduced from 1024
-    BATCH_SIZE = 1    # Keep small
-    NUM_EPOCHS = 10   # Enough to see learning
-    LEARNING_RATE = 1e-4
-    NUM_SAMPLES = 3
+    # Configuration with unweighted loss
+    IMAGE_SIZE = 256
+    BATCH_SIZE = 2
+    NUM_EPOCHS = 75
+    LEARNING_RATE = 5e-5
+    NUM_SAMPLES = 4
+    CROPS_PER_IMAGE = 3
     
     print("=" * 60)
-    print("Low-Resolution Training Test")
+    print("Multi-Crop Training Test (Unweighted Loss)")
     print(f"Configuration:")
     print(f"  - Number of samples: {NUM_SAMPLES}")
-    print(f"  - Image size: {IMAGE_SIZE}x{IMAGE_SIZE} (reduced for memory)")
+    print(f"  - Image size: {IMAGE_SIZE}x{IMAGE_SIZE}")
+    print(f"  - Crops per image: {CROPS_PER_IMAGE}")
+    print(f"  - Effective training samples: {NUM_SAMPLES * CROPS_PER_IMAGE}")
+    print(f"  - Loss: BCE (50%) + Dice (50%)")
     print(f"  - Batch size: {BATCH_SIZE}")
+    print(f"  - Learning rate: {LEARNING_RATE}")
     print(f"  - Epochs: {NUM_EPOCHS}")
     print("=" * 60)
     
@@ -50,9 +55,9 @@ def main():
     # Analyze the pairs
     analyze_matched_pairs(matched_pairs)
     
-    # Split: 2 for training, 1 for validation
-    train_pairs = matched_pairs[:2]
-    val_pairs = matched_pairs[2:3]
+    # Split: 3 for training, 1 for validation
+    train_pairs = matched_pairs[:3]
+    val_pairs = matched_pairs[3:4]
     
     train_images = [p[0] for p in train_pairs]
     train_masks = [p[1] for p in train_pairs]
@@ -60,8 +65,8 @@ def main():
     val_masks = [p[1] for p in val_pairs]
     
     print(f"\n📊 Data split:")
-    print(f"  Training: {len(train_images)} images")
-    print(f"  Validation: {len(val_images)} images")
+    print(f"  Training: {len(train_images)} images × {CROPS_PER_IMAGE} crops = {len(train_images) * CROPS_PER_IMAGE} samples")
+    print(f"  Validation: {len(val_images)} images × {CROPS_PER_IMAGE} crops = {len(val_images) * CROPS_PER_IMAGE} samples")
     
     # Light augmentation for testing
     train_transform = transforms.Compose([
@@ -75,14 +80,18 @@ def main():
         transform=train_transform,
         target_size=(IMAGE_SIZE, IMAGE_SIZE),
         enhance_contrast=True,
-        gaussian_sigma=1.7
+        gaussian_sigma=1.7,
+        random_crop=True,
+        crops_per_image=CROPS_PER_IMAGE
     )
     
     val_dataset = StressGranule16bitDataset(
         val_images, val_masks,
         target_size=(IMAGE_SIZE, IMAGE_SIZE),
         enhance_contrast=True,
-        gaussian_sigma=1.7
+        gaussian_sigma=1.7,
+        random_crop=True,  # Use random crops for validation too
+        crops_per_image=CROPS_PER_IMAGE
     )
     
     # Create data loaders
@@ -145,7 +154,7 @@ def main():
             model, train_loader, val_loader,
             num_epochs=NUM_EPOCHS,
             learning_rate=LEARNING_RATE,
-            patience=5,  # Reduced patience for quick test
+            patience=30,  # Increased from 5 to allow more training
             device=device,
             metrics_tracker=metrics_tracker,
             experiment_name='low_res_test'

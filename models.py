@@ -84,17 +84,23 @@ class StressGranuleDataset(torch.utils.data.Dataset):
 # Enhanced Dataset Class for 16-bit images with preprocessing
 class StressGranule16bitDataset(torch.utils.data.Dataset):
     def __init__(self, image_paths, mask_paths, transform=None, target_size=(256, 256), 
-                 enhance_contrast=True, gaussian_sigma=1.7):
+                 enhance_contrast=True, gaussian_sigma=1.7, random_crop=False,
+                 crops_per_image=3):
         self.image_paths = image_paths
         self.mask_paths = mask_paths
         self.transform = transform
         self.target_size = target_size
         self.enhance_contrast = enhance_contrast
         self.gaussian_sigma = gaussian_sigma
+        self.random_crop = random_crop
+        self.crops_per_image = crops_per_image if random_crop else 1
         
         # Validate paths exist
         self._validate_paths()
-        
+    
+    def __len__(self):
+        return len(self.image_paths) * self.crops_per_image
+    
     def _validate_paths(self):
         """Check if all image and mask paths exist."""
         for img_path, mask_path in zip(self.image_paths, self.mask_paths):
@@ -103,9 +109,6 @@ class StressGranule16bitDataset(torch.utils.data.Dataset):
             if not os.path.exists(mask_path):
                 print(f"Warning: Mask path does not exist: {mask_path}")
         
-    def __len__(self):
-        return len(self.image_paths)
-    
     def _enhance_contrast(self, image, percentile_low=1, percentile_high=99):
         """
         Enhance contrast of 16-bit image using percentile stretching.
@@ -131,17 +134,63 @@ class StressGranule16bitDataset(torch.utils.data.Dataset):
         
         return image_rescaled
     
+    def _center_crop(self, image, crop_size):
+        """Extract a center crop of given size."""
+        h, w = image.shape[:2]
+        start_h = (h - crop_size[0]) // 2
+        start_w = (w - crop_size[1]) // 2
+        return image[start_h:start_h + crop_size[0], start_w:start_w + crop_size[1]]
+    
+    def _random_crop(self, image, mask, crop_size):
+        """Extract a random crop of given size that contains stress granules."""
+        h, w = image.shape[:2]
+        crop_h, crop_w = crop_size
+        
+        # Ensure crop size isn't larger than image
+        crop_h = min(crop_h, h)
+        crop_w = min(crop_w, w)
+        
+        # Find stress granule locations
+        if mask is not None:
+            # Get coordinates of stress granules
+            sg_coords = np.where(mask > 127)
+            if len(sg_coords[0]) > 0:
+                # Randomly select a stress granule pixel
+                idx = np.random.randint(len(sg_coords[0]))
+                center_y, center_x = sg_coords[0][idx], sg_coords[1][idx]
+                
+                # Calculate crop boundaries ensuring we stay within image
+                start_h = max(0, min(h - crop_h, center_y - crop_h//2))
+                start_w = max(0, min(w - crop_w, center_x - crop_w//2))
+            else:
+                # If no stress granules, use random crop
+                start_h = np.random.randint(0, max(1, h - crop_h + 1))
+                start_w = np.random.randint(0, max(1, w - crop_w + 1))
+        else:
+            # For validation or if mask is None, use random crop
+            start_h = np.random.randint(0, max(1, h - crop_h + 1))
+            start_w = np.random.randint(0, max(1, w - crop_w + 1))
+        
+        # Extract crops
+        image_crop = image[start_h:start_h + crop_h, start_w:start_w + crop_w]
+        mask_crop = mask[start_h:start_h + crop_h, start_w:start_w + crop_w] if mask is not None else None
+        
+        return image_crop, mask_crop
+    
     def __getitem__(self, idx):
+        # Map the expanded index back to the original image index
+        img_idx = idx // self.crops_per_image
+        
         try:
             # Load 16-bit image using cv2.IMREAD_UNCHANGED to preserve bit depth
-            image = cv2.imread(self.image_paths[idx], cv2.IMREAD_UNCHANGED)
+            image = cv2.imread(self.image_paths[img_idx], cv2.IMREAD_UNCHANGED)
             if image is None:
-                raise ValueError(f"Failed to load image: {self.image_paths[idx]}")
+                raise ValueError(f"Failed to load image: {self.image_paths[img_idx]}")
             
             # Load 8-bit mask as grayscale
-            mask = cv2.imread(self.mask_paths[idx], cv2.IMREAD_GRAYSCALE)
+            mask = cv2.imread(self.mask_paths[img_idx], cv2.IMREAD_GRAYSCALE)
             if mask is None:
-                raise ValueError(f"Failed to load mask: {self.mask_paths[idx]}")
+                raise ValueError(f"Failed to load mask: {self.mask_paths[img_idx]}")
             
             # Ensure image is single channel
             if len(image.shape) > 2:
@@ -167,9 +216,12 @@ class StressGranule16bitDataset(torch.utils.data.Dataset):
                 # 8-bit image
                 image = image / 255.0
             
-            # Resize to target size
-            image = cv2.resize(image, self.target_size, interpolation=cv2.INTER_LINEAR)
-            mask = cv2.resize(mask, self.target_size, interpolation=cv2.INTER_NEAREST)
+            # Either random crop or resize
+            if self.random_crop:
+                image, mask = self._random_crop(image, mask, self.target_size)
+            else:
+                image = cv2.resize(image, self.target_size, interpolation=cv2.INTER_LINEAR)
+                mask = cv2.resize(mask, self.target_size, interpolation=cv2.INTER_NEAREST)
             
             # Ensure mask is binary (0 or 1)
             mask = (mask > 127).astype(np.float32)
@@ -201,18 +253,22 @@ class DoubleConv(nn.Module):
         super(DoubleConv, self).__init__()
         self.conv = nn.Sequential(
             nn.Conv2d(in_channels, out_channels, 3, 1, 1, bias=False),
-            nn.BatchNorm2d(out_channels),
+            nn.BatchNorm2d(out_channels, momentum=0.1),
             nn.ReLU(inplace=True),
             nn.Conv2d(out_channels, out_channels, 3, 1, 1, bias=False),
-            nn.BatchNorm2d(out_channels),
+            nn.BatchNorm2d(out_channels, momentum=0.1),
             nn.ReLU(inplace=True),
         )
-
+        # Add residual connection if input and output channels match
+        self.use_residual = in_channels == out_channels
+        
     def forward(self, x):
+        if self.use_residual:
+            return self.conv(x) + x
         return self.conv(x)
 
 class UNet(nn.Module):
-    def __init__(self, in_channels=3, out_channels=1, features=[64, 128, 256, 512]):
+    def __init__(self, in_channels=3, out_channels=1, features=[64, 128, 256, 512, 1024]):
         super(UNet, self).__init__()
         self.ups = nn.ModuleList()
         self.downs = nn.ModuleList()
@@ -226,14 +282,23 @@ class UNet(nn.Module):
         # Up part of UNET
         for feature in reversed(features):
             self.ups.append(
-                nn.ConvTranspose2d(
-                    feature*2, feature, kernel_size=2, stride=2,
+                nn.Sequential(
+                    nn.ConvTranspose2d(feature*2, feature, kernel_size=2, stride=2),
+                    nn.BatchNorm2d(feature, momentum=0.1),
+                    nn.ReLU(inplace=True)
                 )
             )
             self.ups.append(DoubleConv(feature*2, feature))
 
         self.bottleneck = DoubleConv(features[-1], features[-1]*2)
-        self.final_conv = nn.Conv2d(features[0], out_channels, kernel_size=1)
+        
+        # Final convolution with additional feature reduction
+        self.final_conv = nn.Sequential(
+            nn.Conv2d(features[0], features[0]//2, kernel_size=3, padding=1),
+            nn.BatchNorm2d(features[0]//2, momentum=0.1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(features[0]//2, out_channels, kernel_size=1)
+        )
         
     def pad_to_power_of_two(self, x):
         """Pad input to ensure dimensions are powers of 2 for U-Net."""
@@ -276,6 +341,7 @@ class UNet(nn.Module):
         
         skip_connections = []
 
+        # Encoder pathway
         for down in self.downs:
             x = down(x)
             skip_connections.append(x)
@@ -284,29 +350,25 @@ class UNet(nn.Module):
         x = self.bottleneck(x)
         skip_connections = skip_connections[::-1]
 
+        # Decoder pathway
         for idx in range(0, len(self.ups), 2):
             x = self.ups[idx](x)
             skip_connection = skip_connections[idx//2]
 
-            # Handle potential shape mismatch properly
-            if x.shape[2:] != skip_connection.shape[2:]:
-                try:
-                    # Try using PyTorch's interpolation
-                    x = F.resize(x, size=skip_connection.shape[2:], interpolation=transforms.InterpolationMode.NEAREST)
-                except (AttributeError, TypeError):
-                    # Fallback for older PyTorch versions
-                    x = nn.functional.interpolate(x, size=skip_connection.shape[2:], mode='nearest')
+            if x.shape != skip_connection.shape:
+                x = F.resize(x, size=skip_connection.shape[2:], 
+                           interpolation=transforms.InterpolationMode.NEAREST)
 
             concat_skip = torch.cat((skip_connection, x), dim=1)
             x = self.ups[idx+1](concat_skip)
 
-        output = torch.sigmoid(self.final_conv(x))
+        x = torch.sigmoid(self.final_conv(x))
         
         # Remove padding if added
         if padding != (0, 0, 0, 0):
-            output = self.remove_padding(output, padding)
+            x = self.remove_padding(x, padding)
             
-        return output
+        return x
 
 # Loss Functions
 def dice_coefficient(pred, target, smooth=1e-6):
@@ -323,8 +385,25 @@ def dice_loss(pred, target, smooth=1e-6):
     """Dice loss function"""
     return 1 - dice_coefficient(pred, target, smooth)
 
+def bce_loss(pred, target):
+    """Standard BCE loss without weighting"""
+    # Clip predictions to avoid log(0)
+    eps = 1e-7
+    pred = torch.clamp(pred, eps, 1 - eps)
+    
+    # Calculate BCE loss
+    loss = -target * torch.log(pred) - (1 - target) * torch.log(1 - pred)
+    return loss.mean()
+
 def combined_loss(pred, target, alpha=0.5):
-    """Combination of BCE and Dice loss"""
-    bce = nn.BCELoss()(pred, target)
+    """
+    Equal combination of BCE and Dice loss
+    Args:
+        pred: Model predictions
+        target: Ground truth masks
+        alpha: Weight for BCE loss (1-alpha is weight for Dice loss)
+               Set to 0.5 for equal weighting
+    """
+    bce = bce_loss(pred, target)
     dice = dice_loss(pred, target)
     return alpha * bce + (1 - alpha) * dice 

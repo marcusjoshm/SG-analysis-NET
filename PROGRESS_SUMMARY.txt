@@ -1,0 +1,81 @@
+# Stress Granule Detection Project Progress Summary
+
+## Current Setup
+- Python 3.12 with PyTorch
+- MPS (Metal Performance Shaders) backend on Mac
+- 16-bit microscopy image processing pipeline
+- Multiple random crops training strategy
+
+## Dataset Characteristics
+- 4 image-mask pairs (3 training, 1 validation)
+- Images: 16-bit, ~4000x4000 to ~5700x4400 pixels, max values ~200-218
+- Masks: 8-bit binary (0 and 255)
+- Naming convention: 
+  - Images: {name}_ch00_t00.tif
+  - Masks: MASK_{name}_t00.tif
+
+## Preprocessing Pipeline
+1. Load 16-bit images with cv2.IMREAD_UNCHANGED
+2. Contrast enhancement using percentile stretching
+3. Gaussian blur (sigma=1.7)
+4. Random 256x256 crops (3 crops per image)
+5. Normalization to [0,1] range
+
+## Model Architecture
+- U-Net with residual connections
+- Input: Single channel 256x256
+- Output: Single channel binary mask
+- Features: [64, 128, 256, 512, 1024]
+- Batch normalization with momentum=0.1
+
+## Training Configuration
+- Batch size: 2
+- Learning rate: 5e-5
+- Epochs: 75
+- Loss function: Combined BCE (50%) + Dice (50%)
+- Data augmentation: Random horizontal/vertical flips
+
+## Experiments Conducted
+
+1. Initial High-Resolution Test (1024x1024)
+   - Result: Out of memory on MPS
+
+2. Low-Resolution Test (512x512)
+   - Initial results: Model predicted all background
+   - Improved with weighted loss: 0.1254 precision, 0.1980 recall
+
+3. Extended Training (512x512, batch size 2)
+   - Best Dice score: 0.2052
+   - Used weighted BCE (pos_weight=44.6) and combined loss (BCE=30%, Dice=70%)
+
+4. Multiple Random Crops (256x256)
+   - Current approach: 3 random crops per image
+   - Effective training samples: 9 (3 images × 3 crops)
+   - Testing both weighted and unweighted loss functions
+
+## Best Results So Far
+- Configuration: 256x256, weighted BCE + Dice loss
+- Metrics: Dice score 0.2052
+- Loss weights: BCE (30%) + Dice (70%)
+- Positive class weight: 44.6
+
+## Current Experiment
+- Testing unweighted loss (BCE 50% + Dice 50%)
+- Using multiple random crops for better coverage
+- Results pending
+
+## Next Steps for GPU Training
+1. Transfer code to GPU machine
+2. Consider increasing:
+   - Image size (512x512 or larger)
+   - Batch size (4 or 8)
+   - Number of crops per image
+3. Experiment with:
+   - Learning rate scheduling
+   - Different loss weightings
+   - Additional data augmentation
+
+## Files Created/Modified
+- models.py: Dataset classes and U-Net implementation
+- train_low_res_test.py: Training script
+- metrics/low_res_test/: Training results and visualizations 
