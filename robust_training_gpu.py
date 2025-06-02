@@ -290,6 +290,15 @@ class RobustDataset(Dataset):
                 transformed = self.transform(image=image_uint8, mask=mask)
                 image = transformed['image'].float() / 255.0
                 mask = transformed['mask'].float()
+                
+                # Ensure correct dimensions
+                if len(image.shape) == 2:
+                    image = image.unsqueeze(0)
+                if len(mask.shape) == 2:
+                    mask = mask.unsqueeze(0)
+                elif len(mask.shape) == 3 and mask.shape[0] > 1:
+                    # If mask has multiple channels, take only the first
+                    mask = mask[0:1]
             else:
                 # Simple conversion to tensor for validation
                 image = torch.from_numpy(image).float().unsqueeze(0)
@@ -313,7 +322,8 @@ def create_robust_augmentations():
     return A.Compose([
         # Spatial transforms
         A.RandomRotate90(p=0.5),
-        A.Flip(p=0.5),
+        A.HorizontalFlip(p=0.5),
+        A.VerticalFlip(p=0.5),
         A.Transpose(p=0.3),
         A.ShiftScaleRotate(shift_limit=0.1, scale_limit=0.2, rotate_limit=45, p=0.7),
         
@@ -477,7 +487,7 @@ def robust_train_model(model, train_loader, val_loader, num_epochs=200, learning
             data, target = data.to(device), target.to(device)
             
             # Mixed precision training
-            with torch.cuda.amp.autocast(enabled=(device.type == 'cuda')):
+            with torch.amp.autocast(device.type, enabled=(device.type == 'cuda')):
                 # Forward pass
                 output = model(data)
                 
@@ -817,11 +827,13 @@ def visualize_predictions(model, val_loader, device, output_file):
         axes[i, 3].set_title(f'Prediction (Dice: {dice:.3f})')
         axes[i, 3].axis('off')
     
-    # Add colorbar for probability map
+    # Use subplots_adjust instead of tight_layout when adding colorbar
+    plt.subplots_adjust(left=0.05, right=0.9, top=0.95, bottom=0.05)
+    
+    # Add colorbar in the adjusted space
     cbar_ax = fig.add_axes([0.92, 0.15, 0.02, 0.7])
     fig.colorbar(im, cax=cbar_ax)
     
-    plt.tight_layout()
     plt.savefig(output_file, dpi=150, bbox_inches='tight')
     plt.close()
 
@@ -904,8 +916,8 @@ def visualize_detailed_predictions(model, val_loader, device, metrics_dir):
 def main():
     """Main function to run robust training"""
     # Configuration
-    IMAGE_SIZE = 256
-    BATCH_SIZE = 4  # Slightly larger batch size for better gradient estimates
+    IMAGE_SIZE = 512  # Increased from 256 to capture more detail
+    BATCH_SIZE = 2  # Reduced from 4 due to larger image size
     NUM_EPOCHS = 200  # More epochs for robustness
     LEARNING_RATE = 1e-4
     PATIENCE = 30  # More patience for robust training
@@ -940,7 +952,7 @@ def main():
     
     # Match all available images and masks
     print("\n📁 Loading dataset...")
-    matched_pairs = match_images_and_masks('data/images', 'data/masks', num_samples=None)  # Use all available
+    matched_pairs = match_images_and_masks('data/images', 'data/masks', max_samples=1000)  # Use large number to get all available
     
     if len(matched_pairs) < 4:
         print("❌ Error: Need at least 4 image-mask pairs")
@@ -1046,7 +1058,11 @@ def main():
             axes[0, i].set_title(f'Preprocessed Image {i+1}')
             axes[0, i].axis('off')
             
-            axes[1, i].imshow(sample_masks[i, 0].numpy(), cmap='gray')
+            # Handle mask shape - it might not have channel dimension
+            if len(sample_masks.shape) == 3:  # [batch, height, width]
+                axes[1, i].imshow(sample_masks[i].numpy(), cmap='gray')
+            else:  # [batch, channels, height, width]
+                axes[1, i].imshow(sample_masks[i, 0].numpy(), cmap='gray')
             axes[1, i].set_title(f'Mask {i+1}')
             axes[1, i].axis('off')
         
