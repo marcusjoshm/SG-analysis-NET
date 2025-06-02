@@ -1,0 +1,2 @@
+filename,processing_time,image_size,num_granules,total_area,mean_granule_size,max_granule_size
+A549_Control_Merged_Processed001_ch00_t00.tif,17.601045846939087,"(4313, 5773)",3358,904259.0,269.28499106611076,2624.0
